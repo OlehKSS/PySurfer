@@ -1,3 +1,4 @@
+from copy import deepcopy
 import logging
 from math import floor
 import os
@@ -22,7 +23,7 @@ from pyface.api import GUI
 
 from . import utils, io
 from .utils import (Surface, verbose, create_color_lut, _get_subjects_dir,
-                    string_types, threshold_filter)
+                    string_types, threshold_filter, _check_units)
 
 
 logger = logging.getLogger('surfer')
@@ -362,6 +363,8 @@ class Brain(object):
     interaction : str
         Can be "trackball" (default) or "terrain", i.e. a turntable-style
         camera.
+    units : str
+        Can be 'm' or 'mm' (default).
 
     Attributes
     ----------
@@ -384,41 +387,13 @@ class Brain(object):
                  cortex="classic", alpha=1.0, size=800, background="black",
                  foreground=None, figure=None, subjects_dir=None,
                  views=['lat'], offset=True, show_toolbar=False,
-                 offscreen=False, interaction='trackball',
-                 config_opts=None, curv=None):
-
-        # Keep backwards compatability
-        if config_opts is not None:
-            msg = ("The `config_opts` dict has been deprecated and will "
-                   "be removed in future versions. You should update your "
-                   "code and pass these options directly to the `Brain` "
-                   "constructor.")
-            warn(msg, DeprecationWarning)
-            cortex = config_opts.get("cortex", cortex)
-            background = config_opts.get("background", background)
-            foreground = config_opts.get("foreground", foreground)
-
-            size = config_opts.get("size", size)
-            width = config_opts.get("width", size)
-            height = config_opts.get("height", size)
-            size = (width, height)
-        # Keep backwards compatability
-        if curv is not None:
-            msg = ("The `curv` keyword has been deprecated and will "
-                   "be removed in future versions. You should update your "
-                   "code and use the `cortex` keyword to specify how the "
-                   "brain surface is rendered. Setting `cortex` to `None` "
-                   "will reproduce the previous behavior when `curv` was "
-                   "set to `False`. To emulate the previous behavior for "
-                   "cases where `curv` was set to `True`, simply omit it.")
-            warn(msg, DeprecationWarning)
-            if not curv:
-                cortex = None
+                 offscreen=False, interaction='trackball', units='mm'):
 
         if not isinstance(interaction, string_types) or \
                 interaction not in ('trackball', 'terrain'):
             raise ValueError('interaction must be "trackball" or "terrain", '
                              'got "%s"' % (interaction,))
+        self._units = _check_units(units)
         col_dict = dict(lh=1, rh=1, both=1, split=2)
         n_col = col_dict[hemi]
         if hemi not in col_dict.keys():
@@ -450,7 +425,8 @@ class Brain(object):
         geo_kwargs, geo_reverse, geo_curv = self._get_geo_params(cortex, alpha)
         for h in geo_hemis:
             # Initialize a Surface object as the geometry
-            geo = Surface(subject_id, h, surf, subjects_dir, offset)
+            geo = Surface(subject_id, h, surf, subjects_dir, offset,
+                          units=self._units)
             # Load in the geometry and (maybe) curvature
             geo.load_geometry()
             if geo_curv:
@@ -548,16 +524,17 @@ class Brain(object):
 
             if state is False and view is None:
                 views[vi] = (mlab.view(figure=_f), mlab.roll(figure=_f),
-                             _f.scene.camera.parallel_scale)
+                             _f.scene.camera.parallel_scale
+                             if _f.scene is not None else False)
 
-            _f.scene.disable_render = not state
+            if _f.scene is not None:
+                _f.scene.disable_render = not state
 
-            if state is True and view is not None:
+            if state is True and view is not None and _f.scene is not None:
                 mlab.draw(figure=_f)
                 with warnings.catch_warnings(record=True):  # traits focalpoint
                     mlab.view(*view[0], figure=_f)
                     mlab.roll(view[1], figure=_f)
-                _f.scene.camera.parallel_scale = view[2]
         # let's do the ugly force draw
         if state is True:
             _force_render(self._figures)
@@ -1105,6 +1082,8 @@ class Brain(object):
                 else:
                     scale_factor = (0.4 * distance /
                                     (4 * array.shape[0] ** (0.33)))
+            if self._units == 'm':
+                scale_factor = scale_factor / 1000.
             magnitude_max = magnitude.max()
         elif array.ndim not in (1, 2):
             raise ValueError('array has must have 1, 2, or 3 dimensions, '
@@ -1609,8 +1588,8 @@ class Brain(object):
             whether the coords parameter should be interpreted as vertex ids
         map_surface : Freesurfer surf or None
             surface to map coordinates through, or None to use raw coords
-        scale_factor : int
-            controls the size of the foci spheres
+        scale_factor : float
+            Controls the size of the foci spheres (relative to 1cm).
         color : matplotlib color code
             HTML name, RBG tuple, or hex code
         alpha : float in [0, 1]
@@ -1635,7 +1614,8 @@ class Brain(object):
             foci_coords = np.atleast_2d(coords)
         else:
             foci_surf = Surface(self.subject_id, hemi, map_surface,
-                                subjects_dir=self.subjects_dir)
+                                subjects_dir=self.subjects_dir,
+                                units=self._units)
             foci_surf.load_geometry()
             foci_vtxs = utils.find_closest_vertices(foci_surf.coords, coords)
             foci_coords = self.geo[hemi].coords[foci_vtxs]
@@ -1650,6 +1630,8 @@ class Brain(object):
 
         views = self._toggle_render(False)
         fl = []
+        if self._units == 'm':
+            scale_factor = scale_factor / 1000.
         for brain in self._brain_list:
             if brain['hemi'] == hemi:
                 fl.append(brain['brain'].add_foci(foci_coords, scale_factor,
@@ -1786,11 +1768,6 @@ class Brain(object):
             brain surface to view (one of 'lateral', 'medial', 'rostral',
             'caudal', 'dorsal', 'ventral', 'frontal', 'parietal') or kwargs to
             pass to :func:`mayavi.mlab.view()`.
-
-        Returns
-        -------
-        view : tuple
-            tuple returned from mlab.view
         roll : float
             camera roll
         distance : float | 'auto' | None
@@ -1799,6 +1776,13 @@ class Brain(object):
             Row index of which brain to use
         col : int
             Column index of which brain to use
+
+        Returns
+        -------
+        view : tuple
+            tuple returned from mlab.view
+        roll : float
+            camera roll returned from mlab.roll
         """
         return self.brain_matrix[row][col].show_view(view, roll, distance)
 
@@ -2263,12 +2247,12 @@ class Brain(object):
         if mlab.options.backend != 'test':
             mlab.savefig(filename, figure=brain._f)
 
-    def _screenshot_figure(self, mode='rgb', antialiased=False, dpi=100):
+    def _screenshot_figure(self, mode='rgb', antialiased=False):
         """Create a matplolib figure from the current screenshot."""
         # adapted from matplotlib.image.imsave
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.figure import Figure
-        fig = Figure(dpi=dpi, frameon=False)  # DPI only used for metadata
+        fig = Figure(frameon=False)
         FigureCanvasAgg(fig)
         fig.figimage(self.screenshot(mode, antialiased), resize=True)
         return fig
@@ -2996,9 +2980,15 @@ class _Hemisphere(object):
 
         _force_render(self._f)
         if view is not None:
+            view = deepcopy(view)
             view['reset_roll'] = True
             view['figure'] = self._f
-            view['distance'] = distance
+            if 'distance' not in view:
+                view['distance'] = distance
+            elif distance is not None and distance != view['distance']:
+                raise ValueError('view parameters view["distance"] != '
+                                 'distance (%s != %s)' % (view['distance'],
+                                                          distance))
             # DO NOT set focal point, can screw up non-centered brains
             # view['focalpoint'] = (0.0, 0.0, 0.0)
             mlab.view(**view)
@@ -3137,7 +3127,8 @@ class _Hemisphere(object):
                 pos_thresh = threshold_filter(mesh, low=old.pos_lims[0])
                 pos = mlab.pipeline.surface(
                     pos_thresh, colormap="YlOrRd", figure=self._f,
-                    vmin=old.pos_lims[1], vmax=old.pos_lims[2])
+                    vmin=old.pos_lims[1], vmax=old.pos_lims[2],
+                    reset_zoom=False)
                 pos.actor.property.backface_culling = False
                 pos_bar = mlab.scalarbar(pos, nb_labels=5)
             pos_bar.reverse_lut = True
@@ -3152,7 +3143,8 @@ class _Hemisphere(object):
                 neg_thresh = threshold_filter(mesh, up=old.neg_lims[0])
                 neg = mlab.pipeline.surface(
                     neg_thresh, colormap="PuBu", figure=self._f,
-                    vmin=old.neg_lims[1], vmax=old.neg_lims[2])
+                    vmin=old.neg_lims[1], vmax=old.neg_lims[2],
+                    reset_zoom=False)
                 neg.actor.property.backface_culling = False
                 neg_bar = mlab.scalarbar(neg, nb_labels=5)
             neg_bar.scalar_bar_representation.position = (0.05, 0.01)
@@ -3208,7 +3200,7 @@ class _Hemisphere(object):
         with warnings.catch_warnings(record=True):
             surf = mlab.pipeline.surface(
                 pipe, colormap=colormap, vmin=fmin, vmax=fmax,
-                opacity=float(alpha), figure=self._f)
+                opacity=float(alpha), figure=self._f, reset_zoom=False)
             surf.actor.property.backface_culling = False
 
         # apply look up table if given
@@ -3238,7 +3230,8 @@ class _Hemisphere(object):
         # Add scalar values to dataset
         array_id, pipe = self._add_scalar_data(ids)
         with warnings.catch_warnings(record=True):
-            surf = mlab.pipeline.surface(pipe, name=annot, figure=self._f)
+            surf = mlab.pipeline.surface(pipe, name=annot, figure=self._f,
+                                         reset_zoom=False)
             surf.actor.property.backface_culling = False
 
         # Set the color table
@@ -3254,7 +3247,8 @@ class _Hemisphere(object):
         from matplotlib.colors import colorConverter
         array_id, pipe = self._add_scalar_data(label)
         with warnings.catch_warnings(record=True):
-            surf = mlab.pipeline.surface(pipe, name=label_name, figure=self._f)
+            surf = mlab.pipeline.surface(pipe, name=label_name, figure=self._f,
+                                         reset_zoom=False)
             surf.actor.property.backface_culling = False
         color = colorConverter.to_rgba(color, alpha)
         cmap = np.array([(0, 0, 0, 0,), color])
@@ -3270,9 +3264,9 @@ class _Hemisphere(object):
         """Add a morphometry overlay to the image"""
         array_id, pipe = self._add_scalar_data(morph_data)
         with warnings.catch_warnings(record=True):
-            surf = mlab.pipeline.surface(pipe, colormap=colormap,
-                                         vmin=min, vmax=max,
-                                         name=measure, figure=self._f)
+            surf = mlab.pipeline.surface(
+                pipe, colormap=colormap, vmin=min, vmax=max, name=measure,
+                figure=self._f, reset_zoom=False)
 
         # Get the colorbar
         if colorbar:
@@ -3303,8 +3297,9 @@ class _Hemisphere(object):
         array_id, pipe = self._add_scalar_data(scalar_data)
         with warnings.catch_warnings(record=True):
             thresh = threshold_filter(pipe, low=min)
-            surf = mlab.pipeline.contour_surface(thresh, contours=n_contours,
-                                                 line_width=line_width)
+            surf = mlab.pipeline.contour_surface(
+                thresh, contours=n_contours, line_width=line_width,
+                reset_zoom=False)
         if lut is not None:
             l_m = surf.module_manager.scalar_lut_manager
             l_m.load_lut_from_list(lut / 255.)

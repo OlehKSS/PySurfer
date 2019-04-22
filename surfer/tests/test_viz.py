@@ -8,11 +8,13 @@ import pytest
 from mayavi import mlab
 import nibabel as nib
 import numpy as np
-from numpy.testing import assert_array_equal
+from numpy.testing import assert_array_equal, assert_array_less
+
 from unittest import SkipTest
 
 from surfer import Brain, io, utils
-from surfer.utils import requires_fsaverage, requires_imageio, requires_fs
+from surfer.utils import (requires_fsaverage, requires_imageio, requires_fs,
+                          _get_extra)
 
 warnings.simplefilter('always')
 
@@ -27,13 +29,12 @@ def _set_backend(backend=None):
     """Use testing backend for Windows."""
     only_test = (sys.platform == 'win32' or
                  (os.getenv('TRAVIS', 'false') == 'true' and
-                  sys.version[0] == '3'))
+                  sys.platform == 'linux') and sys.version[0] == '3')
     if backend is None:
         backend = 'test' if only_test else 'auto'
-    else:
-        if only_test:
-            raise SkipTest('non-testing backend crashes on Windows and '
-                           'Travis Py3k')
+    if only_test and backend != 'test':
+        raise SkipTest('non-testing backend crashes on Windows and '
+                       'Travis Py3k')
     mlab.options.backend = backend
 
 
@@ -64,18 +65,11 @@ def check_view(brain, view):
 @requires_fsaverage()
 def test_offscreen():
     """Test offscreen rendering."""
-    if os.getenv('TRAVIS', 'false') == 'true':
-        if sys.platform == 'darwin':
-            raise SkipTest('Offscreen Travis tests fail on OSX')
-        if sys.version[0] == '3':
-            raise SkipTest('Offscreen Travis tests fail on Py3k')
     _set_backend()
     brain = Brain(*std_args, offscreen=True)
-    # Sometimes the first screenshot is rendered with a different
-    # resolution on OS X
-    brain.screenshot()
     shot = brain.screenshot()
-    assert_array_equal(shot.shape, (800, 800, 3))
+    assert_array_less((400, 400, 2), shot.shape)
+    assert_array_less(shot.shape, (801, 801, 4))
     brain.close()
 
 
@@ -93,8 +87,6 @@ def test_image(tmpdir):
     brain.close()
 
     brain = Brain(*std_args, size=100)
-    if sys.platform == 'darwin' and os.getenv('TRAVIS', '') == 'true':
-        raise SkipTest('image saving on OSX travis is not supported')
     brain.save_image(tmp_name)
     brain.save_image(tmp_name, 'rgba', True)
     brain.screenshot()
@@ -138,7 +130,8 @@ def test_brains():
         brain = Brain(subject_id, hemi, surf, title=title, cortex=cort,
                       alpha=alpha, size=s, background=bg, foreground=fg,
                       figure=fig, subjects_dir=sd)
-        brain.set_distance()
+        with np.errstate(invalid='ignore'):  # encountered in double_scalars
+            brain.set_distance()
         brain.close()
     brain = Brain(subject_id, hemi, surf, subjects_dir=sd,
                   interaction='terrain')
@@ -227,7 +220,7 @@ def test_foci():
     coords = [[-36, 18, -3],
               [-43, 25, 24],
               [-48, 26, -2]]
-    brain.add_foci(coords, map_surface="white", color="gold")
+    brain.add_foci(coords, map_surface="white", color="gold", name='test1')
 
     subj_dir = utils._get_subjects_dir()
     annot_path = pjoin(subj_dir, subject_id, 'label', 'lh.aparc.a2009s.annot')
@@ -235,8 +228,13 @@ def test_foci():
     verts = np.arange(0, len(ids))
     coords = np.random.permutation(verts[ids == 74])[:10]
     scale_factor = 0.7
-    brain.add_foci(coords, coords_as_verts=True,
-                   scale_factor=scale_factor, color="#A52A2A")
+    brain.add_foci(coords, coords_as_verts=True, scale_factor=scale_factor,
+                   color="#A52A2A", name='test2')
+    with pytest.raises(ValueError):
+        brain.remove_foci(['test4'])
+    brain.remove_foci('test1')
+    brain.remove_foci()
+    assert len(brain.foci_dict) == 0
     brain.close()
 
 
@@ -250,30 +248,30 @@ def test_label():
     brain = Brain(subject_id, hemi, surf)
     view = get_view(brain)
 
-    brain.add_label("BA1")
+    extra, subj_dir = _get_extra()
+    brain.add_label("BA1" + extra)
     check_view(brain, view)
-    brain.add_label("BA1", color="blue", scalar_thresh=.5)
-    subj_dir = utils._get_subjects_dir()
+    brain.add_label("BA1" + extra, color="blue", scalar_thresh=.5)
     label_file = pjoin(subj_dir, subject_id,
-                       "label", "%s.MT.label" % hemi)
+                       "label", "%s.MT%s.label" % (hemi, extra))
     brain.add_label(label_file)
-    brain.add_label("BA44", borders=True)
-    brain.add_label("BA6", alpha=.7)
+    brain.add_label("BA44" + extra, borders=True)
+    brain.add_label("BA6" + extra, alpha=.7)
     brain.show_view("medial")
-    brain.add_label("V1", color="steelblue", alpha=.6)
-    brain.add_label("V2", color="#FF6347", alpha=.6)
-    brain.add_label("entorhinal", color=(.2, 1, .5), alpha=.6)
+    brain.add_label("V1" + extra, color="steelblue", alpha=.6)
+    brain.add_label("V2" + extra, color="#FF6347", alpha=.6)
+    brain.add_label("entorhinal" + extra, color=(.2, 1, .5), alpha=.6)
     brain.set_surf('white')
     brain.show_view(dict(elevation=40, distance=430), distance=430)
     with pytest.raises(ValueError, match='!='):
         brain.show_view(dict(elevation=40, distance=430), distance=431)
 
     # remove labels
-    brain.remove_labels('V1')
-    assert 'V2' in brain.labels_dict
-    assert 'V1' not in brain.labels_dict
+    brain.remove_labels('V1' + extra)
+    assert 'V2' + extra in brain.labels_dict
+    assert 'V1' + extra not in brain.labels_dict
     brain.remove_labels()
-    assert 'V2' not in brain.labels_dict
+    assert 'V2' + extra not in brain.labels_dict
 
     brain.close()
 
@@ -357,7 +355,8 @@ def test_morphometry():
 def test_movie(tmpdir):
     """Test saving a movie of an MEG inverse solution."""
     import imageio
-
+    if sys.version_info < (3,):
+        raise SkipTest('imageio ffmpeg requires Python 3')
     # create and setup the Brain instance
     _set_backend()
     brain = Brain(*std_args)
@@ -369,8 +368,6 @@ def test_movie(tmpdir):
                    smoothing_steps=10, time=time, time_label='time=%0.2f ms')
     brain.scale_data_colormap(fmin=13, fmid=18, fmax=22, transparent=True)
 
-    if sys.platform == 'darwin' and os.getenv('TRAVIS', '') == 'true':
-        raise SkipTest('movie saving on OSX Travis is not supported')
     # save movies with different options
     dst = str(tmpdir.join('test.mov'))
     # test the number of frames in the movie
@@ -437,15 +434,15 @@ def test_probabilistic_labels():
     brain = Brain("fsaverage", "lh", "inflated",
                   cortex="low_contrast")
 
-    brain.add_label("BA1", color="darkblue")
+    extra, subj_dir = _get_extra()
+    brain.add_label("BA1" + extra, color="darkblue")
+    brain.add_label("BA1" + extra, color="dodgerblue", scalar_thresh=.5)
+    brain.add_label("BA45" + extra, color="firebrick", borders=True)
+    brain.add_label("BA45" + extra, color="salmon", borders=True,
+                    scalar_thresh=.5)
 
-    brain.add_label("BA1", color="dodgerblue", scalar_thresh=.5)
-
-    brain.add_label("BA45", color="firebrick", borders=True)
-    brain.add_label("BA45", color="salmon", borders=True, scalar_thresh=.5)
-
-    subj_dir = utils._get_subjects_dir()
-    label_file = pjoin(subj_dir, "fsaverage", "label", "lh.BA6.label")
+    label_file = pjoin(subj_dir, "fsaverage", "label",
+                       "lh.BA6%s.label" % (extra,))
     prob_field = np.zeros_like(brain.geo['lh'].x)
     ids, probs = nib.freesurfer.read_label(label_file, read_scalars=True)
     prob_field[ids] = probs

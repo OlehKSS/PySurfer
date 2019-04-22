@@ -20,6 +20,7 @@ from traits.api import (HasTraits, Range, Int, Float,
                         Bool, Enum, on_trait_change, Instance)
 from tvtk.api import tvtk
 from pyface.api import GUI
+from traitsui.api import View, Item, Group, VGroup, HGroup, VSplit, HSplit
 
 from . import utils, io
 from .utils import (Surface, verbose, create_color_lut, _get_subjects_dir,
@@ -200,13 +201,17 @@ def _make_viewer(figure, n_row, n_col, title, scene_size, offscreen,
     if figure is None:
         # spawn scenes
         h, w = scene_size
-        if offscreen is True:
+        if offscreen == 'auto':
+            offscreen = mlab.options.offscreen
+        if offscreen:
             orig_val = mlab.options.offscreen
-            mlab.options.offscreen = True
-            with warnings.catch_warnings(record=True):  # traits
-                figures = [[mlab.figure(size=(h / n_row, w / n_col))
-                            for _ in range(n_col)] for __ in range(n_row)]
-            mlab.options.offscreen = orig_val
+            try:
+                mlab.options.offscreen = True
+                with warnings.catch_warnings(record=True):  # traits
+                    figures = [[mlab.figure(size=(w / n_col, h / n_row))
+                                for _ in range(n_col)] for __ in range(n_row)]
+            finally:
+                mlab.options.offscreen = orig_val
             _v = None
         else:
             # Triage: don't make TraitsUI if we don't have to
@@ -224,6 +229,11 @@ def _make_viewer(figure, n_row, n_col, title, scene_size, offscreen,
                     for f in figure:
                         f.scene.interactor.interactor_style = \
                             tvtk.InteractorStyleTerrain()
+            for figure in figures:
+                for f in figure:
+                    # on a non-testing backend, and using modern VTK/Mayavi
+                    if hasattr(getattr(f.scene, 'renderer', None), 'use_fxaa'):
+                        f.scene.renderer.use_fxaa = True
     else:
         if isinstance(figure, int):  # use figure with specified id
             figure = [mlab.figure(figure, size=scene_size)]
@@ -245,7 +255,6 @@ def _make_viewer(figure, n_row, n_col, title, scene_size, offscreen,
 
 class _MlabGenerator(HasTraits):
     """TraitsUI mlab figure generator"""
-    from traitsui.api import View
     view = Instance(View)
 
     def __init__(self, n_row, n_col, width, height, title, **traits):
@@ -276,7 +285,6 @@ class _MlabGenerator(HasTraits):
         return figures, self._v
 
     def _get_gen_view(self):
-        from traitsui.api import (View, Item, VGroup, HGroup)
         ind = 0
         va = []
         for ri in range(self.n_row):
@@ -356,10 +364,11 @@ class Brain(object):
         surface where hemispheres typically overlap (Default: True)
     show_toolbar : bool
         If True, toolbars will be shown for each view.
-    offscreen : bool
+    offscreen : bool | str
         If True, rendering will be done offscreen (not shown). Useful
         mostly for generating images or screenshots, but can be buggy.
-        Use at your own risk.
+        Use at your own risk. Can be "auto" (default) to use
+        ``mlab.options.offscreen``.
     interaction : str
         Can be "trackball" (default) or "terrain", i.e. a turntable-style
         camera.
@@ -383,11 +392,12 @@ class Brain(object):
     texts : dict
         The text objects.
     """
+
     def __init__(self, subject_id, hemi, surf, title=None,
                  cortex="classic", alpha=1.0, size=800, background="black",
                  foreground=None, figure=None, subjects_dir=None,
                  views=['lat'], offset=True, show_toolbar=False,
-                 offscreen=False, interaction='trackball', units='mm'):
+                 offscreen='auto', interaction='trackball', units='mm'):
 
         if not isinstance(interaction, string_types) or \
                 interaction not in ('trackball', 'terrain'):
@@ -1178,7 +1188,8 @@ class Brain(object):
 
         self._data_dicts[hemi].append(data)
 
-        self.scale_data_colormap(min, mid, max, transparent, center, alpha)
+        self.scale_data_colormap(min, mid, max, transparent, center, alpha,
+                                 data)
 
         if initial_time_index is not None:
             self.set_data_time_index(initial_time_index)
@@ -1263,12 +1274,13 @@ class Brain(object):
             self._to_borders(labels, hemi, borders)
 
             # Handle null labels properly
-            # (tksurfer doesn't use the alpha channel, so sometimes this
-            # is set weirdly. For our purposes, it should always be 0.
-            # Unless this sometimes causes problems?
-            cmap[np.where(cmap[:, 4] == 0), 3] = 0
-            if np.any(labels == 0) and not np.any(cmap[:, -1] == 0):
-                cmap = np.vstack((cmap, np.zeros(5, int)))
+            cmap[:, 3] = 255
+            bgcolor = self._brain_color
+            bgcolor[-1] = 0
+            cmap[cmap[:, 4] < 0, 4] += 2 ** 24  # wrap to positive
+            cmap[cmap[:, 4] <= 0, :4] = bgcolor
+            if np.any(labels == 0) and not np.any(cmap[:, -1] <= 0):
+                cmap = np.vstack((cmap, np.concatenate([bgcolor, [0]])))
 
             # Set label ids sensibly
             order = np.argsort(cmap[:, -1])
@@ -1448,6 +1460,34 @@ class Brain(object):
         # if no data is left, reset time properties
         if all(len(brain.data) == 0 for brain in self.brains):
             self.n_times = self._times = None
+
+    def remove_foci(self, name=None):
+        """Remove foci added with ``Brain.add_foci()``.
+
+        Parameters
+        ----------
+        name : str | list of str | None
+            Names of the foci to remove (if None, remove all).
+
+        Notes
+        -----
+        Only foci added with a unique names can be removed.
+        """
+        if name is None:
+            keys = tuple(self.foci_dict)
+        else:
+            if isinstance(name, str):
+                keys = (name,)
+            else:
+                keys = name
+            if not all(key in self.foci_dict for key in keys):
+                missing = ', '.join(key for key in keys if key not in
+                                    self.foci_dict)
+                raise ValueError("foci=%r: no foci named %s" % (name, missing))
+
+        for key in keys:
+            for points in self.foci_dict.pop(key):
+                points.remove()
 
     def remove_labels(self, labels=None, hemi=None):
         """Remove one or more previously added labels from the image.
@@ -1853,9 +1893,24 @@ class Brain(object):
             if brain._f.scene is not None:
                 brain._f.scene.reset_zoom()
 
+    @property
+    def _brain_color(self):
+        geo_actor = self._brain_list[0]['brain']._geo_surf.actor
+        if self._brain_list[0]['brain']._using_lut:
+            bgcolor = np.mean(
+                self._brain_list[0]['brain']._geo_surf.module_manager
+                .scalar_lut_manager.lut.table.to_array(), axis=0)
+        else:
+            bgcolor = geo_actor.property.color
+            if len(bgcolor) == 3:
+                bgcolor = bgcolor + (1,)
+            bgcolor = 255 * np.array(bgcolor)
+        bgcolor[-1] *= geo_actor.property.opacity
+        return bgcolor
+
     @verbose
     def scale_data_colormap(self, fmin, fmid, fmax, transparent,
-                            center=None, alpha=1.0, verbose=None):
+                            center=None, alpha=1.0, data=None, verbose=None):
         """Scale the data colormap.
 
         The colormap may be sequential or divergent. When the colormap is
@@ -1894,33 +1949,28 @@ class Brain(object):
             center of the (divergent) colormap
         alpha : float
             sets the overall opacity of colors, maintains transparent regions
+        data : dict | None
+            The data entry for which to scale the colormap.
+            If None, will use the data dict from either the left or right
+            hemisphere (in that order).
         verbose : bool, str, int, or None
             If not None, override default verbose level (see surfer.verbose).
         """
         divergent = center is not None
 
         # Get the original colormap
-        for h in ['lh', 'rh']:
-            data = self.data_dict[h]
-            if data is not None:
-                table = data["orig_ctable"].copy()
-                break
+        if data is None:
+            for h in ['lh', 'rh']:
+                data = self.data_dict[h]
+                if data is not None:
+                    break
+        table = data["orig_ctable"].copy()
 
         lut = _scale_mayavi_lut(table, fmin, fmid, fmax, transparent,
                                 center, alpha)
 
         # Get the effective background color as 255-based 4-element array
-        geo_actor = self._brain_list[0]['brain']._geo_surf.actor
-        if self._brain_list[0]['brain']._using_lut:
-            bgcolor = np.mean(
-                self._brain_list[0]['brain']._geo_surf.module_manager
-                .scalar_lut_manager.lut.table.to_array(), axis=0)
-        else:
-            bgcolor = geo_actor.property.color
-            if len(bgcolor) == 3:
-                bgcolor = bgcolor + (1,)
-            bgcolor = 255 * np.array(bgcolor)
-        bgcolor[-1] *= geo_actor.property.opacity
+        bgcolor = self._brain_color
 
         views = self._toggle_render(False)
         # Use the new colormap
@@ -2919,6 +2969,7 @@ def _scale_mayavi_lut(lut_table, fmin, fmid, fmax, transparent,
 
 class _Hemisphere(object):
     """Object for visualizing one hemisphere with mlab"""
+
     def __init__(self, subject_id, hemi, figure, geo, geo_curv,
                  geo_kwargs, geo_reverse, subjects_dir, bg_color, backend,
                  fg_color):
@@ -3101,7 +3152,7 @@ class _Hemisphere(object):
                 vmax=fmax, figure=self._f, opacity=vector_alpha)
 
         # Enable backface culling
-        quiver.actor.property.backface_culling = False
+        quiver.actor.property.backface_culling = True
         quiver.mlab_source.update()
 
         # Compute scaling for the glyphs
@@ -3439,7 +3490,6 @@ class TimeViewer(HasTraits):
         brain(s) to control
     """
     # Nested import of traisui for setup.py without X server
-    from traitsui.api import (View, Item, VSplit, HSplit, Group)
     min_time = Int(0)
     max_time = Int(1E9)
     current_time = Range(low="min_time", high="max_time", value=0)
@@ -3504,7 +3554,7 @@ class TimeViewer(HasTraits):
         self.configure_traits()
 
     @on_trait_change("smoothing_steps")
-    def set_smoothing_steps(self):
+    def _set_smoothing_steps(self):
         """ Change number of smooting steps
         """
         if self._disable_updates:
@@ -3518,7 +3568,7 @@ class TimeViewer(HasTraits):
             brain.set_data_smoothing_steps(self.smoothing_steps)
 
     @on_trait_change("orientation")
-    def set_orientation(self):
+    def _set_orientation(self):
         """ Set the orientation
         """
         if self._disable_updates:
@@ -3528,7 +3578,7 @@ class TimeViewer(HasTraits):
             brain.show_view(view=self.orientation)
 
     @on_trait_change("current_time")
-    def set_time_point(self):
+    def _set_time_point(self):
         """ Set the time point shown
         """
         if self._disable_updates:
@@ -3538,7 +3588,7 @@ class TimeViewer(HasTraits):
             brain.set_data_time_index(self.current_time)
 
     @on_trait_change("fmin, fmid, fmax, transparent")
-    def scale_colormap(self):
+    def _scale_colormap(self):
         """ Scale the colormap
         """
         if self._disable_updates:
